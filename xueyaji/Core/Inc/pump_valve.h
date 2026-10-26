@@ -30,8 +30,9 @@ void Valve_Open(void);
 /* 重置闭环柔顺放气控制器状态 (在进入放气阶段前调用) */
 void Valve_ResetSmoothBleed(float start_pressure_mmhg);
 
-/* 闭环微秒级柔顺放气控制：每 240ms 微裂泄气 ~1.0mmHg (~4.2mmHg/s)，消除电磁阀大幅一张一合顿挫感 */
-uint32_t Valve_StepBleedAdaptive(float current_pressure_mmhg);
+/* 自然漏气辅助：rate 为平滑后的实测泄压速率 (mmHg/s)。
+ * 低于 2.0 mmHg/s 时开一个微脉冲并返回脉宽 (us)，否则不动阀门并返回 0。 */
+uint32_t Valve_LeakAssist(float current_pressure_mmhg, float rate_mmhg_s);
 
 /* 紧急完全泄压与断电停泵 */
 void Emergency_Exhaust(void);

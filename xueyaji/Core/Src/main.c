@@ -12,9 +12,10 @@ static SystemState_t state;
 static BP_Result_t result;
 static uint32_t state_at, measure_at, inflate_at, valid_at, sequence;
 static uint32_t phase_at,last_ramp,last_bleed,last_ui,last_slow,zero_at;
-static uint8_t phase,retries;
+static uint8_t phase,retries,above,hist_n,hist_i;
 static uint16_t zero_count;
-static float pressure,slow_pressure,watch_pressure,zero_sum,zero_min,zero_max;
+static float pressure,raw_pressure,shown_pressure,slow_pressure,watch_pressure,bleed_ref;
+static float zero_sum,zero_min,zero_max,hist[5];
 static bool have_pressure,finished;
 static uint8_t requests;
 void App_RequestStart(void) { requests|=1U; }
@@ -25,6 +26,19 @@ void App_RequestToggleStartStop(void) {
 }
 SystemState_t App_GetState(void) { return state; }
 static bool active(void) { return state!=STATE_IDLE && state!=STATE_ERROR; }
+/* Median of the last 5 samples (~62ms at 80Hz): drops isolated I2C/EMI spikes
+ * that used to stop the pump early or trip overpressure, but keeps the ~1Hz
+ * oscillometric pulse. Every control decision uses this value, never raw. */
+static float median5(float x) {
+ float s[5]; uint8_t i,j;
+ hist[hist_i]=x; hist_i=(uint8_t)((hist_i+1U)%5U); if (hist_n<5U) hist_n++;
+ for (i=0;i<hist_n;i++) {
+  float v=hist[i]; j=i;
+  while (j && s[j-1U]>v) { s[j]=s[j-1U]; j--; }
+  s[j]=v;
+ }
+ return s[hist_n/2U];
+}
 static void change(SystemState_t next) { state=next; state_at=HAL_GetTick(); }
 static void fault(uint8_t code) {
  char msg[32];
@@ -40,7 +54,8 @@ void App_Init(void) {
 static void start(void) {
  Emergency_Exhaust(); memset(&result,0,sizeof(result));
  BP_Algorithm_Reset(); measure_at=HAL_GetTick(); phase=0; retries=0;
- zero_count=0; finished=false; BSP_SetMeasuringFlag(true);
+ zero_count=0; above=0; hist_n=0; hist_i=0; have_pressure=false;
+ finished=false; BSP_SetMeasuringFlag(true);
  change(STATE_SELF_CHECK);
 }
 void App_Process(void) {
@@ -56,9 +71,12 @@ void App_Process(void) {
  }
  if (XGZP6847D_GetSample(&sample) && sample.sequence!=sequence) {
   sequence=sample.sequence; valid_at=sample.timestamp_ms;
-  pressure=sample.pressure_mmhg; fresh=true;
-  if (!have_pressure) { slow_pressure=pressure; have_pressure=true; }
-  else slow_pressure+=0.015f*(pressure-slow_pressure);
+  raw_pressure=sample.pressure_mmhg; pressure=median5(raw_pressure); fresh=true;
+  if (!have_pressure) { slow_pressure=shown_pressure=pressure; have_pressure=true; }
+  else {
+   slow_pressure+=0.015f*(pressure-slow_pressure);
+   shown_pressure+=0.25f*(pressure-shown_pressure);
+  }
  }
  /* I2C may cross a millisecond boundary. Refresh after service: subtracting
   * a newer sample/start timestamp from the old tick would underflow. */
@@ -90,26 +108,27 @@ void App_Process(void) {
     Valve_Close(); phase=1; phase_at=now;
    }
   } else if (now-phase_at>=200UL) {
-   Pump_StartSoftRamp(52); inflate_at=now; last_ramp=now; change(STATE_INFLATE);
+   Pump_StartSoftRamp(52); inflate_at=now; last_ramp=now; above=0; change(STATE_INFLATE);
   }
   break;
  case STATE_INFLATE:
   if (now-inflate_at>=INFLATE_TIMEOUT_MS) { fault(BP_ERR_INFLATE); break; }
   if (now-last_ramp>=12UL) { Pump_UpdateSoftRamp(); last_ramp=now; }
-  if (fresh && pressure>=DEFAULT_INFLATE_MMHG) {
+  if (fresh) above=(pressure>=DEFAULT_INFLATE_MMHG)?(uint8_t)(above+1U):0U;
+  if (above>=INFLATE_CONFIRM_SAMPLES) {
    Pump_SetSpeed(0); change(STATE_SETTLE);
   }
   break;
  case STATE_SETTLE:
   if (now-inflate_at>=INFLATE_TIMEOUT_MS) { fault(BP_ERR_INFLATE); break; }
-  if (fresh && now-state_at>=700UL) {
-   if (pressure<DEFAULT_INFLATE_MMHG-10.0f) {
+  if (fresh && now-state_at>=SETTLE_MS) {
+   if (pressure<DEFAULT_INFLATE_MMHG-SETTLE_ACCEPT_MARGIN_MMHG) {
     if (++retries>3U) { fault(BP_ERR_INFLATE); break; }
-    Pump_StartSoftRamp(58); last_ramp=now; change(STATE_INFLATE);
+    Pump_StartSoftRamp(58); last_ramp=now; above=0; change(STATE_INFLATE);
    } else {
     BP_Algorithm_Reset(); slow_pressure=pressure;
     Valve_ResetSmoothBleed(slow_pressure);
-    last_bleed=now; last_slow=now; watch_pressure=slow_pressure;
+    last_bleed=now; last_slow=now; watch_pressure=bleed_ref=slow_pressure;
     change(STATE_DEFLATE_SAMPLE);
    }
   }
@@ -121,13 +140,17 @@ void App_Process(void) {
   }
   if (now-last_slow>=8000UL) {
    float drop=watch_pressure-slow_pressure;
-   if (drop<4.0f || drop>64.0f) { fault(BP_ERR_BLEED); break; }
+   if (drop<BLEED_MIN_DROP_8S_MMHG || drop>BLEED_MAX_DROP_8S_MMHG) { fault(BP_ERR_BLEED); break; }
    last_slow=now; watch_pressure=slow_pressure;
   }
   if (fresh) BP_Algorithm_PushSample(pressure,sample.timestamp_ms);
-  if (fresh && now-last_bleed>=STEP_PLATEAU_HOLD_MS) {
-   Valve_StepBleedAdaptive(slow_pressure); last_bleed=HAL_GetTick();
-   BP_Algorithm_NotifyValvePulse(last_bleed);
+  /* Valve stays closed: the cuff leaks down on its own. Measure the smoothed
+   * leak rate once per second and add one valve pulse only if it is too slow. */
+  if (fresh && now-last_bleed>=DEFLATE_CHECK_MS) {
+   float rate=(bleed_ref-slow_pressure)*1000.0f/(float)(now-last_bleed);
+   bleed_ref=slow_pressure;
+   if (Valve_LeakAssist(slow_pressure,rate)) BP_Algorithm_NotifyValvePulse(HAL_GetTick());
+   last_bleed=HAL_GetTick();
   }
   break;
  case STATE_CALCULATE:
@@ -148,8 +171,8 @@ void App_Process(void) {
   char telemetry[64];
   last_ui=now; OLED_Clear();
   if (active()) {
-   snprintf(telemetry,sizeof(telemetry),"T:%lu,P:%.3f,N:%u\r\n",
-      (unsigned long)valid_at,pressure,BP_Algorithm_GetPeakCount());
+   snprintf(telemetry,sizeof(telemetry),"T:%lu,P:%.2f,R:%.2f,N:%u\r\n",
+      (unsigned long)valid_at,pressure,raw_pressure,BP_Algorithm_GetPeakCount());
    BSP_UART1_SendString(telemetry);
   }
   if (state==STATE_ERROR) OLED_ShowError(result.err_code);
@@ -159,7 +182,7 @@ void App_Process(void) {
    OLED_ShowString(0,0,"Smart BP Monitor",16);
    OLED_ShowString(0,24,XGZP6847D_IsOnline()?"Press RESET / A0":"Sensor NoACK!",16);
    OLED_Refresh();
-  } else OLED_DrawPressureBar(pressure,DEFAULT_INFLATE_MMHG,BP_Algorithm_GetPeakCount());
+  } else OLED_DrawPressureBar(shown_pressure,DEFAULT_INFLATE_MMHG,BP_Algorithm_GetPeakCount());
  }
  OLED_Service();
  BSP_WatchdogFeed();

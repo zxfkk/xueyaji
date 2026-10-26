@@ -7,7 +7,7 @@
 #include <string.h>
 #include <math.h>
 static uint32_t now,seq,service_delay; static bool online=true,pump,valve_closed;
-static float raw,zero; static char log_buffer[2048];
+static float raw,zero; static char log_buffer[16384];
 uint32_t HAL_GetTick(void) { return now; }
 void BSP_IO_Service(void) { }
 void BSP_WatchdogFeed(void) { }
@@ -30,7 +30,7 @@ void Valve_Open(void) { valve_closed=false; }
 void Valve_Close(void) { valve_closed=true; }
 void Emergency_Exhaust(void) { pump=false; valve_closed=false; }
 void Valve_ResetSmoothBleed(float p) { (void)p; }
-uint32_t Valve_StepBleedAdaptive(float p) { (void)p; return 600; }
+uint32_t Valve_LeakAssist(float p,float r) { (void)p; return r<2.0f?600:0; }
 void OLED_Clear(void) { }
 void OLED_Refresh(void) { }
 void OLED_Service(void) { }
@@ -50,10 +50,11 @@ static void inflate(void) {
  assert(App_GetState()==STATE_INFLATE && pump && valve_closed);
 }
 static void deflate(void) {
- inflate();raw=166;advance(30);assert(!pump);advance(800);
+ inflate();raw=166;advance(120);assert(!pump);advance(800);
  assert(App_GetState()==STATE_DEFLATE_SAMPLE);
 }
 static void safe_error(const char *code) {
+ if (!strstr(log_buffer,code)) fprintf(stderr,"want %s got: %s\n",code,log_buffer);
  assert(App_GetState()==STATE_ERROR); assert(!pump && !valve_closed);
  assert(strstr(log_buffer,code)); assert(!strstr(log_buffer,"RESULT:"));
 }
@@ -61,10 +62,17 @@ int main(void) {
  reset();service_delay=2;App_RequestStart();advance(100);
  assert(App_GetState()==STATE_SELF_CHECK); /* Tick advances inside I2C service. */
  reset();inflate();online=false;advance(120);safe_error("E04");
- reset();inflate();raw=270;advance(20);safe_error("E01");
+ reset();inflate();raw=270;advance(60);safe_error("E01");
  reset();inflate();advance(40000);safe_error("E02");
  reset();App_RequestStart();raw=15;advance(8100);safe_error("E05");
  reset();deflate();advance(8100);safe_error("E07");
+ /* One spiky sample must neither stop the pump nor trip overpressure. */
+ reset();inflate();raw=300;advance(13);raw=100;advance(100);
+ assert(App_GetState()==STATE_INFLATE && pump);
+ reset();inflate();raw=170;advance(13);raw=100;advance(100);assert(pump);
+ /* Leaky connector: the plateau sags after the pump stops; still measure. */
+ reset();inflate();raw=166;advance(120);assert(!pump);raw=153;advance(800);
+ assert(App_GetState()==STATE_DEFLATE_SAMPLE);
  reset();inflate();App_RequestStop();advance(1);
  assert(App_GetState()==STATE_IDLE && !pump && !valve_closed);
  /* Idempotent start must not stop an active measurement. */

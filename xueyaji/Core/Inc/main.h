@@ -27,7 +27,19 @@ enum {
 #define SAMPLE_PERIOD_US 12500UL
 #define SENSOR_TIMEOUT_MS 100UL
 #define KEY_DEBOUNCE_MS 200UL
-#define STEP_PLATEAU_HOLD_MS 240UL
+/* Inflation stops only after N consecutive median-filtered samples reach the
+ * target, so a single sensor spike cannot stop the pump. After the pump stops,
+ * the reading falls (connector back pressure decays, cuff leaks); accept the
+ * plateau if it stays within the margin instead of re-inflating/aborting. */
+#define INFLATE_CONFIRM_SAMPLES 3U
+#define SETTLE_MS 500UL
+#define SETTLE_ACCEPT_MARGIN_MMHG 15.0f
+/* Deflation relies on the cuff's natural leak; the valve only assists when the
+ * smoothed leak rate is checked every DEFLATE_CHECK_MS and found too slow. */
+#define DEFLATE_CHECK_MS 1000UL
+/* E07 window over 8s: below MIN = stalled, above MAX = cuff disconnected. */
+#define BLEED_MIN_DROP_8S_MMHG 4.0f
+#define BLEED_MAX_DROP_8S_MMHG 120.0f
 /* Experimental values retained for the existing valve; validate on the bench. */
 #define STEP_WATER_HAMMER_BLANK_MS 38UL
 void App_RequestToggleStartStop(void);

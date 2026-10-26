@@ -5,17 +5,19 @@
 #include <math.h>
 static I2C_Bus_t bus;
 static uint8_t addr, probe;
-static bool selected, pending, online;
+static bool selected, pending, online, found;
 static uint32_t deadline_us, started_ms, poll_ms, retry_ms;
 static float zero;
 static PressureSample_t latest;
 static bool finite_value(float x) { return x == x && x > -1000000.0f && x < 1000000.0f; }
 static void failed(uint32_t now) {
- online=false; pending=false; selected=false; retry_ms=now+10UL;
+ /* Once the sensor has answered, retry the same bus/address: pump EMI glitches
+  * must not send the driver off probing other addresses for several cycles. */
+ online=false; pending=false; selected=found; retry_ms=now+10UL;
 }
 void XGZP6847D_Init(void) {
  bus=I2C_BUS_1; addr=XGZP6847D_ADDR_6D; probe=0;
- selected=false; pending=false; online=false; zero=0;
+ selected=false; pending=false; online=false; found=false; zero=0;
  memset(&latest,0,sizeof(latest));
  deadline_us=BSP_GetMicros(); retry_ms=HAL_GetTick();
 }
@@ -61,6 +63,6 @@ void XGZP6847D_Service(void) {
   if (!finite_value(pressure) || pressure < -20.0f || pressure > 330.0f) { failed(now); return; }
   latest.raw_mmhg=pressure; latest.timestamp_ms=HAL_GetTick(); latest.sequence++;
   if (!latest.sequence) latest.sequence=1;
-  online=true; selected=true; pending=false;
+  online=true; selected=true; found=true; pending=false;
  }
 }
