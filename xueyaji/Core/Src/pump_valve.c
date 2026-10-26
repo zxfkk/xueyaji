@@ -9,8 +9,6 @@
 static uint8_t  s_curr_duty      = 0;
 static uint8_t  s_target_duty    = 0;
 static uint32_t s_bleed_pulse_us = 650UL;  /* Experimental pulse width, bench calibration required. */
-static float s_prev_bleed_p;
-static uint32_t s_feedback_at;
 
 void Actuator_Init(void) {
     /* 1. 开启 GPIOA, GPIOB 与 TIM3 时钟 */
@@ -77,23 +75,22 @@ void Valve_Open(void) {
 
 void Valve_ResetSmoothBleed(float start_pressure_mmhg) {
     /* Retain the existing hardware pulse range; do not assume a valve travel time. */
+    (void)start_pressure_mmhg;
     s_bleed_pulse_us = 600UL;
-    s_prev_bleed_p = start_pressure_mmhg;
-    s_feedback_at = HAL_GetTick();
 }
 
-uint32_t Valve_StepBleedAdaptive(float current_pressure_mmhg) {
-    /* Tune using smoothed pressure and elapsed time, not the instantaneous pulse. */
-    uint32_t now=HAL_GetTick(), elapsed=now-s_feedback_at;
-    if (elapsed>=1200UL) {
-        float rate=(s_prev_bleed_p-current_pressure_mmhg)*1000.0f/(float)elapsed;
-        s_prev_bleed_p=current_pressure_mmhg; s_feedback_at=now;
-        if (rate<0.5f) s_bleed_pulse_us+=400UL;
-        else if (rate<2.5f) s_bleed_pulse_us+=120UL;
-        else if (rate>4.5f && s_bleed_pulse_us>420UL) s_bleed_pulse_us-=120UL;
+uint32_t Valve_LeakAssist(float current_pressure_mmhg, float rate_mmhg_s) {
+    /* 气路接口本身漏气: 默认阀门保持关闭，让袖带自然泄压。
+     * 只有自然泄压速率低于 2.0 mmHg/s 时才补一个微脉冲；速率过快时只缩短
+     * 下一次脉宽、不再开阀，避免 "脉宽越加越大 -> 突然大开 -> 压力大跳" 的振荡。 */
+    if (rate_mmhg_s > 4.5f) {
+        if (s_bleed_pulse_us > 450UL) s_bleed_pulse_us -= 150UL;
+        return 0UL;
     }
+    if (rate_mmhg_s >= 2.0f) return 0UL;
+    s_bleed_pulse_us += (rate_mmhg_s < 1.0f) ? 200UL : 60UL;
 
-    /* 随袖带气压降低给予微幅前馈补偿，并严格限制在 300us ~ 3200us (0.3~3.2ms) 微裂区 */
+    /* 严格限制在 300us ~ 3200us (0.3~3.2ms) 微裂区，高压段上限更低 */
     uint32_t max_us = (current_pressure_mmhg > 100.0f) ? 2200UL : 3200UL;
     if (s_bleed_pulse_us < 300UL)  s_bleed_pulse_us = 300UL;
     if (s_bleed_pulse_us > max_us) s_bleed_pulse_us = max_us;
