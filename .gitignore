@@ -1,0 +1,15 @@
+# Keil MDK build outputs
+xueyaji/Project/Objects/
+xueyaji/Project/Listings/
+*.uvguix
+*.uvguix.*
+
+# Office temporary/lock files
+~$*
+
+# Python
+__pycache__/
+*.pyc
+
+# Build directories
+/build/
